@@ -7,14 +7,21 @@
  * Date           Author       Notes
  * 2022-11-24     liwentai       the first version
  */
-#include <ti_led.h>
-#include <rtthread.h>
+#include "ti_led.h"
+#include "stdlib.h"
+#include <stdint.h>
+#include <board.h>
 #include <string.h>
 #include <drv_i2c_nca9555.h>
 
 #define DBG_TAG "ti_led"
 #define DBG_LVL DBG_INFO
 #include <rtdbg.h>
+
+ALIGN(RT_ALIGN_SIZE)
+static rt_slist_t _slist_head = RT_SLIST_OBJECT_INIT(_slist_head); /**< Led 链表头节点 */
+static struct rt_mutex led_mtx;                                    /**< Led 互斥锁 */
+
 
 /**
  * @addtogroup 具体LED操作方法
@@ -25,19 +32,12 @@
  * @param argv 参数字符串存储指针
  * @return 返回一个用于led应用包的对象
  */
-static led_t nca9555_led_init(int argc, char *argv[])
+static led_t nca9555_led_init(const void* buf)
 {
     led_t led = RT_NULL;
     char device_name[RT_NAME_MAX];
-    if (argc == 2)
-    {
-        rt_strncpy(device_name, argv[1], RT_NAME_MAX);
-    }
-    else
-    {
-        LOG_I("put in a char represent of nca9555 led device.");
-        return RT_NULL;
-    }
+    rt_strncpy(device_name, (char*)buf, RT_NAME_MAX);
+
     rt_device_t dev = rt_device_find(device_name);
 
     if (led == RT_NULL) {
@@ -54,7 +54,7 @@ static led_t nca9555_led_init(int argc, char *argv[])
             rt_device_control(dev, OUTPUT, str);
         }
     }
-    led.user_data = (void*)dev;
+    led->user_data = (void*)dev;
     return led;
 }
 
@@ -64,7 +64,7 @@ static led_t nca9555_led_init(int argc, char *argv[])
  * @param stat  写入的逻辑电平
  * @return      0为操作成功，-1为操作失败
  */
-static rt_err_t nca9555_led_action(led_t *led, uint8_t stat)
+static rt_err_t nca9555_led_action(led_t led, uint8_t stat)
 {
     rt_device_t dev = (rt_device_t)led->user_data;
     if (rt_device_write(dev, stat, led->name, 1) != 1) {
@@ -74,7 +74,7 @@ static rt_err_t nca9555_led_action(led_t *led, uint8_t stat)
 }
 
 /** 将nca9555方法写入led对象*/
-led_t nca9555_led =
+const static struct led_ops nca9555_ops =
 {
         .init = nca9555_led_init,
         .action = nca9555_led_action
@@ -87,10 +87,10 @@ led_t nca9555_led =
  * 动作完成后回调函数
  * @param led
  */
-static void led_default_compelete_callback(led_t *led)
+static void led_default_compelete_callback(led_t led)
 {
     RT_ASSERT(led);
-    LOG_D("led pin:%d compeleted.", led->pin);
+    LOG_D("led pin:%d compeleted.", led->name);
 }
 
 /**
@@ -104,13 +104,13 @@ static void led_default_compelete_callback(led_t *led)
  @endverbatim
  * @return
  */
-static rt_err_t led_get_blink_arr(led_t *led, const char *blink_cmd)
+static rt_err_t led_get_blink_arr(led_t led, const char *blink_cmd)
 {
     RT_ASSERT(led);
     RT_ASSERT(led->blink_arr == RT_NULL);
 
     const char *ptr = blink_cmd;
-    uint32_t *blink_arr = RT_NULL;
+    uint16_t *blink_arr = RT_NULL;
     while (*ptr) {
         if (*ptr == ',')
             led->blink_num++;
@@ -122,13 +122,13 @@ static rt_err_t led_get_blink_arr(led_t *led, const char *blink_cmd)
     if (led->blink_num == 0)
         return -RT_ERROR;
 
-    blink_arr = rt_malloc(led->blink_num * sizeof(uint32_t));
+    blink_arr = rt_malloc(led->blink_num * sizeof(uint16_t));
     if (blink_arr == RT_NULL)
         return -RT_ENOMEM;
-    rt_memset(blink_arr, 0, led->blink_num * sizeof(uint32_t));
+    rt_memset(blink_arr, 0, led->blink_num * sizeof(uint16_t));
 
     ptr = blink_cmd;
-    for (uint32_t i = 0; i < led->blink_num; i++) {
+    for (uint16_t i = 0; i < led->blink_num; i++) {
         blink_arr[i] = atoi(ptr);
         ptr = strchr(ptr, ',');
         if (ptr)
@@ -140,9 +140,9 @@ static rt_err_t led_get_blink_arr(led_t *led, const char *blink_cmd)
     return RT_EOK;
 }
 
-led_t *led_create(const char* name, uint8_t active_logic, const char *light_mode, int32_t loop_cnt)
+led_t led_create(const char* name, uint8_t active_logic, const char *blink_cmd, int16_t loop_num)
 {
-    led_t *led = (led_t *)rt_malloc(sizeof(led_t));
+    led_t led = (led_t)rt_malloc(sizeof(led_t));
     if (led == RT_NULL){
         LOG_E("can not allocate memory for ti_led %s.",name);
         return RT_NULL;
@@ -152,4 +152,140 @@ led_t *led_create(const char* name, uint8_t active_logic, const char *light_mode
     led->active = TI_LED_NOACT;
     led->active_logic = active_logic;
     led->blink_arr = RT_NULL;
+    led->blink_index = 0;
+    /** 记录闪烁模式*/
+    if (blink_cmd) {
+        if (led_get_blink_arr(led, blink_cmd) != RT_EOK) {
+            rt_free(led);
+            return RT_NULL;
+        }
+    }
+
+    led->loop_num = loop_num;
+    led->loop_cnt = 0;
+    led->tick_timeout = rt_tick_get();
+    led->compelete = led_default_compelete_callback;
+
+    led->ops = nca9555_ops;
+
+    rt_slist_init(&led->slist);
+
+    return led;
+}
+
+rt_err_t led_delete(led_t led)
+{
+    RT_ASSERT(led);
+
+    rt_mutex_take(&led_mtx, RT_WAITING_FOREVER);
+    rt_slist_remove(&_slist_head, &(led->slist));
+    led->slist.next = RT_NULL;
+    rt_mutex_release(&led_mtx);
+
+    if (led->blink_arr) {
+        rt_free((uint32_t *)led->blink_arr);
+        led->blink_arr = RT_NULL;
+    }
+    rt_free(led);
+
+    return RT_EOK;
+}
+
+rt_err_t led_start(led_t led)
+{
+    RT_ASSERT(led);
+
+    rt_mutex_take(&led_mtx, RT_WAITING_FOREVER);
+    if (led->active) {
+        rt_mutex_release(&led_mtx);
+        return -RT_ERROR;
+    }
+    if ((led->blink_arr == RT_NULL) || (led->blink_num == 0)) {
+        rt_mutex_release(&led_mtx);
+        return -RT_ERROR;
+    }
+    led->blink_index = 0;
+    led->loop_cnt = 0;
+    led->tick_timeout = rt_tick_get();
+    rt_slist_append(&_slist_head, &(led->slist));
+    led->active = TI_LED_ACTIVE;
+    rt_mutex_release(&led_mtx);
+
+    return RT_EOK;
+}
+
+rt_err_t led_stop(led_t led)
+{
+    RT_ASSERT(led);
+
+    rt_mutex_take(&led_mtx, RT_WAITING_FOREVER);
+    if (!led->active) {
+        rt_mutex_release(&led_mtx);
+        return RT_EOK;
+    }
+
+    rt_slist_remove(&_slist_head, &(led->slist));
+    led->slist.next = RT_NULL;
+    led->active = TI_LED_NOACT;
+    rt_mutex_release(&led_mtx);
+}
+
+void led_toggle(led_t led)
+{
+    if (!led->active) {
+        led->ops.action(led, led->active_logic);
+    }else {
+        led->ops.action(led, !led->active_logic);
+    }
+}
+
+void led_on(led_t led)
+{
+    led->ops.action(led, led->active_logic);
+}
+
+void led_off(led_t led)
+{
+    led->ops.action(led, !led->active_logic);
+}
+
+void led_process(void)
+{
+    rt_slist_t *node;
+
+    rt_mutex_take(&led_mtx, RT_WAITING_FOREVER);
+    rt_slist_for_each(node, &_slist_head)
+    {
+        led_t led = rt_slist_entry(node, struct led_item, slist);
+        if (led->loop_cnt == 0) {
+            led_stop(led);
+            if (led->compelete) {
+                led->compelete(led);
+            }
+
+            node = &_slist_head;
+            continue;
+        }
+    __repeat:
+        if ((rt_tick_get() - led->tick_timeout) < (RT_TICK_MAX / 2)) {
+            if (led->blink_index < led->blink_num) {
+                if (led->blink_arr[led->blink_index] == 0) {
+                    led->blink_index++;
+                    goto __repeat;
+                }
+                if (led->blink_index % 2) {
+                    led_off(led);
+                } else {
+                    led_on(led);
+                }
+                led->tick_timeout = rt_tick_get() + rt_tick_from_millisecond(led->blink_arr[led->blink_index]);
+                led->blink_index++;
+            } else {
+                led->blink_index = 0;
+                if (led->loop_cnt < led->loop_num)
+                    led->loop_cnt;
+            }
+        }
+    }
+    rt_mutex_release(&led_mtx);
 }
