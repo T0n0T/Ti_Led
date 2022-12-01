@@ -148,7 +148,7 @@ led_t led_create(const void* name, uint8_t active_logic, const char *blink_cmd, 
     }
 
     led->loop_num = loop_num;
-    led->loop_cnt = 0;
+    led->loop_cnt = loop_num;
     led->tick_timeout = rt_tick_get();
     led->compelete = led_default_complete_callback;
 
@@ -194,7 +194,7 @@ rt_err_t led_start(led_t led)
         return -RT_ERROR;
     }
     led->blink_index = 0;
-    led->loop_cnt = 0;
+    led->loop_cnt = led->loop_num;
     led->tick_timeout = rt_tick_get();
     rt_slist_append(&_slist_head, &(led->slist));
     led->active = TI_LED_ACTIVE;
@@ -217,8 +217,6 @@ rt_err_t led_stop(led_t led)
     rt_slist_remove(&_slist_head, &(led->slist));
     led->slist.next = RT_NULL;
     led->active = TI_LED_NOACT;
-    led->blink_index = 0;
-    led->loop_cnt = 0;
     rt_mutex_release(&led_mtx);
     return RT_EOK;
 }
@@ -252,10 +250,9 @@ void led_process(void)
     {
         led_t led = rt_slist_entry(node, struct led_item, slist);
 //        rt_kprintf("here.loop_cnt = %d\n", led->loop_cnt);
-        if (led->loop_cnt == led->loop_num) {
+        if (led->loop_cnt == 0) {
             led_stop(led);
-            if (led->compelete) {
-                led->loop_cnt++;
+            if (led->compelete) {                
                 led->compelete(led);
             }
 
@@ -278,8 +275,8 @@ void led_process(void)
                 led->blink_index++;
             } else {
                 led->blink_index = 0;
-                if (led->loop_cnt < led->loop_num)
-                    led->loop_cnt++;
+                if (led->loop_cnt > 0)
+                    led->loop_cnt--;
             }
         }
     }
@@ -290,3 +287,4 @@ void led_env_init(void)
 {
     rt_mutex_init(&led_mtx, "led_mtx", RT_IPC_FLAG_FIFO);
 }
+

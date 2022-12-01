@@ -14,7 +14,7 @@
 #include <rtdevice.h>
 
 #define     TI_LED_NOACT       0
-#define     TI_LED_ACTIVE      0
+#define     TI_LED_ACTIVE      1
 
 typedef struct led_item* led_t;
 struct led_ops
